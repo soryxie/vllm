@@ -14,7 +14,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len 4096 \
     --enable-expert-parallel \
     --data-parallel-size 4 \
-    --enforce-eager
+    --enforce-eager > /profile_json/log.txt 2>&1 &
 
 curl -X POST -s http://localhost:8001/v1/completions \
 -H "Content-Type: application/json" \
@@ -27,6 +27,9 @@ curl -X POST -s http://localhost:8001/v1/completions \
 
 # vim vllm/distributed/device_communicators/all2all.py
 # vim vllm/model_executor/layers/fused_moe/layer.py
+
+# vim vllm/model_executor/models/qwen3_moe.py
+# vim vllm/distributed/device_communicators/all2all.py
 
 pip install datasets pandas
 python3 benchmarks/benchmark_serving.py \
