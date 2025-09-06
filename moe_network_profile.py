@@ -69,14 +69,13 @@ def main(rank, world_size):
         
         counts_tensor = torch.tensor(input_split_sizes, dtype=torch.int, device=torch.device('cuda', rank))
         gather_list = [torch.empty_like(counts_tensor) for _ in range(world_size)]
+        dist.barrier() 
+        torch.cuda.synchronize()
+        start_time = time.time()
         dist.all_gather(gather_list, counts_tensor)
         output_split_sizes = [int(gather_list[src][rank].item()) for src in range(world_size)]
         total_recv = sum(output_split_sizes)
         output_tensor = torch.empty((total_recv, hidden_size), dtype=dtype, device=torch.device('cuda', rank))
-        
-        dist.barrier() 
-        torch.cuda.synchronize()
-        start_time = time.time()
         dist.all_to_all_single(output_tensor, input_tensor, output_split_sizes, input_split_sizes)
         torch.cuda.synchronize()
         elapsed_time = time.time() - start_time
@@ -86,7 +85,7 @@ def main(rank, world_size):
             "rank": rank,
             "send_counts": send_counts,
             "recv_counts": output_split_sizes,
-            "time_ms": round(elapsed_time * 1000, 3)
+            "time_ms": elapsed_time,
         }
         outfile.write(json.dumps(result) + "\n")
         outfile.flush()

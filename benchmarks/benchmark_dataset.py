@@ -424,6 +424,11 @@ class ShareGPTDataset(BenchmarkDataset):
             completion_ids = tokenizer(completion).input_ids
             prompt_len = len(prompt_ids)
             new_output_len = len(completion_ids) if output_len is None else output_len
+            if prompt_len < 1024:
+                continue
+            else:
+                prompt=tokenizer.decode(prompt_ids[:1024])
+                prompt_len=1024
             if not is_valid_sequence(
                 prompt_len,
                 new_output_len,

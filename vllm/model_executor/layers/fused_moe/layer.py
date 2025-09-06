@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Callable, Literal, Optional, overload
 
 import torch
+import time
+import json
 import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
 
@@ -355,6 +357,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
+        ep_rank: int,
         renormalize: bool,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
@@ -382,6 +385,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer=layer,
             router_logits=router_logits,
             top_k=top_k,
+            ep_rank=ep_rank,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             topk_group=topk_group,
@@ -405,6 +409,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         use_grouped_topk: bool,
         top_k: int,
+        ep_rank: int,
         router_logits: torch.Tensor,
         renormalize: bool,
         topk_group: Optional[int] = None,
@@ -439,6 +444,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count)
+        
+        if ep_rank == 0:
+            with open("/profile_json/ep_states.jsonl", "a") as f:
+                record = {
+                    "topk_weights": topk_weights.shape,
+                    "topk_ids": topk_ids.tolist(),
+                }
+                f.write(json.dumps(record) + "\n")
+
 
         if self.rocm_aiter_moe_enabled:
             return self.rocm_aiter_fused_experts(
@@ -1491,6 +1505,7 @@ class FusedMoE(torch.nn.Module):
             x=hidden_states,
             router_logits=router_logits,
             top_k=self.top_k,
+            ep_rank=self.ep_rank,
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
