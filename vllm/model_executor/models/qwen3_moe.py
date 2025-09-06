@@ -25,6 +25,8 @@
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
+import time
+import json
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -295,6 +297,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.cuda.synchronize()
+        st = time.time()
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -311,6 +315,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        torch.cuda.synchronize()
+        et = time.time()
+        if get_pp_group().rank == 0:
+            with open("/profile_json/layer_time.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "st": st,
+                    "et": et,
+                }) + "\n")
         return hidden_states, residual
 
 

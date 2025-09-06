@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING, Any
 
+import time
+import json
 import torch
 import torch.distributed as dist
 
@@ -50,6 +52,8 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
     def dispatch(self, hidden_states: torch.Tensor,
                  router_logits: torch.Tensor):
+        torch.cuda.synchronize()
+        st = time.time()
         cu_tokens_across_dp_cpu = get_forward_context(
         ).dp_metadata.cu_tokens_across_dp_cpu
 
@@ -57,6 +61,14 @@ class NaiveAll2AllManager(All2AllManagerBase):
                                              cu_tokens_across_dp_cpu)
         router_logits = self.naive_multicast(router_logits,
                                              cu_tokens_across_dp_cpu)
+        torch.cuda.synchronize()
+        et = time.time()
+        if self.rank == 0:
+            with open("/profile_json/all2all_time.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "st": st,
+                    "et": et,
+                }) + "\n")
         return hidden_states, router_logits
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:

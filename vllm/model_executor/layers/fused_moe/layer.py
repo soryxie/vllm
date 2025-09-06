@@ -1347,6 +1347,10 @@ class FusedMoE(torch.nn.Module):
 
             topk_ids = topk_ids.to(dtype=indices_type)
 
+        topk_ids = torch.tensor([0, 1, 32, 33, 64, 65, 96, 97], 
+            device=topk_weights.device, 
+            dtype=torch.int32).repeat(topk_weights.shape[0], 1)
+
         assert topk_ids.dtype == indices_type or indices_type is None
 
         return topk_weights, topk_ids
