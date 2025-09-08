@@ -1,4 +1,4 @@
-sudo docker run --rm -it --gpus all \
+sudo docker run --rm -it --gpus all --network=host \
     --entrypoint /bin/bash \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -v ~/moe_test/vllm/profile_json:/profile_json \
@@ -28,12 +28,13 @@ curl -X POST -s http://localhost:8000/v1/completions \
 # vim benchmarks/benchmark_dataset.py
 
 pip install datasets pandas
+# num-prompt = 1/2/4
 python3 benchmarks/benchmark_serving.py \
     --base-url http://localhost:8000 \
     --dataset-name sharegpt \
     --dataset-path /profile_json/ShareGPT_V3_unfiltered_cleaned_split.json \
     --sharegpt-output-len 1 \
-    --num-prompts 16 \
+    --num-prompts 4 \
     --save-result \
     --save-detailed \
     --result-dir /profile_json/ \
