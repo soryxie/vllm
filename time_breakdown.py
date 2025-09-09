@@ -52,22 +52,22 @@ def main():
 
         i += 1
 
-    attn_avg = np.mean(attn)
-    mlp_avg = np.mean(mlp)
-    native_comm_avg = np.mean(native_comm)
-    all2all_comm_avg = np.mean(all2all_comm)
+    attn_sum = sum(attn)
+    mlp_sum = sum(mlp)
+    native_comm_sum = sum(native_comm)
+    all2all_comm_sum = sum(all2all_comm)
 
-    # mlp_avg -= all2all_comm_avg
-    # all2all_comm_avg *= 2
+    mlp_sum -= all2all_comm_sum
+    all2all_comm_sum *= 2
 
     colors = ['#8dd3c7', '#bebada', '#fb8072']
-    plt.pie([attn_avg, mlp_avg, all2all_comm_avg] \
-        , labels=[f'Attention {attn_avg*1000:.2f}ms', f'MLP {mlp_avg*1000:.2f}ms', f'All2All {all2all_comm_avg*1000:.2f}ms']
+    plt.pie([attn_sum, mlp_sum, all2all_comm_sum] \
+        , labels=[f'Attention {attn_sum*1000:.2f}ms', f'MLP {mlp_sum*1000:.2f}ms', f'All2All {all2all_comm_sum*1000:.2f}ms']
         , autopct='%1.1f%%', startangle=90, colors=colors)
     plt.title('Time breakdown')
     plt.axis('equal')
     plt.savefig('time_breakdown.png')
-    print(f"all2all to native_comm ratio: {all2all_comm_avg / native_comm_avg:.2f}")
+    print(f"all2all to native_comm ratio: {all2all_comm_sum / native_comm_sum:.2f}")
 
 if __name__ == "__main__":
     main()

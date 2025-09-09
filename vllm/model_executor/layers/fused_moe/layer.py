@@ -444,7 +444,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count)
-        
+
+        with open(f"/profile_json/ep_states_gpu_4_token_1024_node_{ep_rank}.jsonl", "a") as f:
+            record = {
+                "topk_weights": topk_weights.shape,
+                "topk_ids": topk_ids.tolist(),
+            }
+            f.write(json.dumps(record) + "\n")
+
         if ep_rank == 0:
             with open("/profile_json/ep_states.jsonl", "a") as f:
                 record = {

@@ -70,20 +70,14 @@ sudo docker rm node0 node1
 
 docker exec -it node0 bash -lc '
 ib_write_bw -R -d mlx5_0 -F -p 19999 --report_gbits
-'
-
-************************************
-* Waiting for client to connect... *
-************************************
+' 
 
 docker exec -it node1 bash -lc '
 ib_write_bw -R -d mlx5_2 -F -p 19999 --report_gbits 10.0.12.1
 '
 
-Received 10 times ADDR_ERROR
- Unable to perform rdma_client function
- Unable to init the socket connection
-
+sudo ip route add 10.2.11.0/24 via 10.0.12.254 dev rdma0
+sudo ip route add 10.0.11.0/24 via 10.2.12.254 dev rdma2
 
 docker exec -it node1 bash -lc '
 ip addr show mlx5_0
