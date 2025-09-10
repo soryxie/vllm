@@ -41,7 +41,7 @@ torchrun --nnodes=4 --nproc_per_node=2 --node_rank=0 \
   /moe_test/moe_8_card_profile.py
 '
 
-# 10.0.12.1
+# node 1
 docker exec -it node1 bash -lc '
 set -e
 echo "node1 -> mlx5_2"
@@ -56,6 +56,39 @@ torchrun --nnodes=4 --nproc_per_node=2 --node_rank=1 \
   --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
   /moe_test/moe_8_card_profile.py
 '
+
+# node 2
+docker exec -it node0 bash -lc '
+set -e
+echo "node0 -> mlx5_0"
+export NCCL_DEBUG=INFO
+export NCCL_IB_HCA=mlx5_0
+export NCCL_IB_GID_INDEX=3 
+export MASTER_ADDR=192.168.1.48
+export MASTER_PORT=12345
+export CUDA_VISIBLE_DEVICES=0,2
+
+torchrun --nnodes=4 --nproc_per_node=2 --node_rank=2 \
+  --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+  /moe_test/moe_8_card_profile.py
+'
+
+# node 3
+docker exec -it node1 bash -lc '
+set -e
+echo "node1 -> mlx5_2"
+export NCCL_DEBUG=INFO
+export NCCL_IB_HCA=mlx5_2
+export NCCL_IB_GID_INDEX=3
+export MASTER_ADDR=192.168.1.48
+export MASTER_PORT=12345
+export CUDA_VISIBLE_DEVICES=1,3
+
+torchrun --nnodes=4 --nproc_per_node=2 --node_rank=3 \
+  --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+  /moe_test/moe_8_card_profile.py
+'
+
 
 # Appendix: 观察ip
 PID0=$(docker inspect -f '{{.State.Pid}}' node0)
