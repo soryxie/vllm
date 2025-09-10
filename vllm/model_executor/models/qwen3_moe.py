@@ -322,6 +322,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 f.write(json.dumps({
                     "st": st,
                     "et": et,
+                    "batch_size": hidden_states.shape[0],
                 }) + "\n")
         return hidden_states, residual
 

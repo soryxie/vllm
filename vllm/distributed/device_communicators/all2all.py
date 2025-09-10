@@ -66,12 +66,15 @@ class NaiveAll2AllManager(All2AllManagerBase):
         if self.rank == 0:
             with open("/profile_json/all2all_time.jsonl", "a") as f:
                 f.write(json.dumps({
+                    "type": "broadcast",
                     "st": st,
                     "et": et,
                 }) + "\n")
         return hidden_states, router_logits
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        torch.cuda.synchronize()
+        st = time.time()
         cu_tokens_across_dp_cpu = get_forward_context(
         ).dp_metadata.cu_tokens_across_dp_cpu
         start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
@@ -80,6 +83,15 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
         all_hidden_states = self.dp_group.all_reduce(hidden_states)
         hidden_states = all_hidden_states[start:end, :]
+        torch.cuda.synchronize()
+        et = time.time()
+        if self.rank == 0:
+            with open("/profile_json/all2all_time.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "type": "all_reduce",
+                    "st": st,
+                    "et": et,
+                }) + "\n")
         return hidden_states
 
     def destroy(self):
