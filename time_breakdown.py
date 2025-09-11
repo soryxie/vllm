@@ -8,57 +8,39 @@ import matplotlib.pyplot as plt
 
 def read_files():
     layer_times = []
-    with open("./profile_json/layer_time.jsonl", "r") as f:
+    with open("./profile_json/compute.jsonl", "r") as f:
         lines = f.readlines()
         for line in lines:
             data = json.loads(line.strip())
             layer_times.append(data)
+
     all2all_times = []
-    with open("./profile_json/all2all_time.jsonl", "r") as f:
+    with open("./profile_json/moe_profile_8card.jsonl", "r") as f:
         lines = f.readlines()
         for line in lines:
             data = json.loads(line.strip())
             all2all_times.append(data)
-    
-    with open("profile_json/moe_profile_8card_0.jsonl", "r") as f:
-        lines = f.readlines()
-        moe_profiles = []
-        for line in lines:
-            data = json.loads(line.strip())
-            moe_profiles.append(data)
 
-    return layer_times, all2all_times, moe_profiles
+    return layer_times, all2all_times
 
 def main():
-    layer_times, all2all_times, moe_profiles = read_files()
-
-    native_comm = []
-    all2all_comm = []
-    attn = []
-    mlp = []
+    layer_times, all2all_times = read_files()
 
     i = 0
-    for layer, native, all2all in zip(layer_times, all2all_times, moe_profiles):
-        attention_time = native["st"] - layer["st"]
-        assert attention_time >= 0, f"layer {i}, native_st {native['st']}, layer_st {layer['st']}"
-
-        mlp_time = layer["et"] - native["et"]
-        assert mlp_time >= 0, f"layer {i}, native_et {native['et']}, layer_et {layer['et']}"
-
-        native_comm.append(native["et"] - native["st"])
+    attn = []
+    mlp = []
+    all2all_comm = []
+    native_comm = []
+    for i, layer, all2all in zip(range(len(layer_times)), layer_times, all2all_times):
+        attn.append(layer["attn"])
+        mlp.append(layer["mlp"])
+        native_comm.append(layer["all2all"])
         all2all_comm.append(all2all["time_ms"])
-        attn.append(attention_time)
-        mlp.append(mlp_time)
-
-        i += 1
 
     attn_sum = sum(attn)
     mlp_sum = sum(mlp)
     native_comm_sum = sum(native_comm)
-    all2all_comm_sum = sum(all2all_comm)
-
-    mlp_sum -= all2all_comm_sum
-    all2all_comm_sum *= 2
+    all2all_comm_sum = sum(all2all_comm) / 2
 
     colors = ['#8dd3c7', '#bebada', '#fb8072']
     plt.pie([attn_sum, mlp_sum, all2all_comm_sum] \
