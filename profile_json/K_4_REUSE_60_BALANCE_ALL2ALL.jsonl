@@ -1,0 +1,11 @@
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.11070609092712402}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.01260519027709961}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.01214599609375}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.011635065078735352}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.012026071548461914}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.011960029602050781}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.011998653411865234}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.012006521224975586}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.011977910995483398}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.01186227798461914}
+{"layer": 0, "rank": 0, "send_counts": [0, 1024, 1024, 1024], "senf_shapes": [3072, 4096], "recv_counts": [0, 1024, 1024, 1024], "recv_shapes": [3072, 4096], "time": 0.011669635772705078}

@@ -99,7 +99,7 @@ class Profiler:
 
         if rank == 0:
             reuse_ratio = int(self.reused_ratio * 100)
-            output_filename = f"/profile_json/K_{self.topk}_REUSE_{reuse_ratio}_{'ALL2ALL' if self.only_all2all else 'ALLFLOW'}.jsonl"
+            output_filename = f"/profile_json/K_{self.topk}_REUSE_{reuse_ratio}_BALANCE_{'ALL2ALL' if self.only_all2all else 'ALLFLOW'}.jsonl"
             outfile = open(output_filename, "w")
 
         for layer_idx in [0 for _ in range(11)]:# range(self.layer_num):
@@ -109,14 +109,19 @@ class Profiler:
             self.init_send_recv(layer_idx, self.topk)
 
             dist.barrier()
+            time.sleep(1)
 
             if self.only_all2all:
                 """
                 Only All to all       (sync)
                 """
-                send_split_sizes = [self.nodes[self.rank].send_state[dst]["count"] for dst in range(all2all_world_size)]
-                recv_split_sizes = [self.nodes[self.rank].recv_state[src]["count"] for src in range(all2all_world_size)]
-                
+                # send_split_sizes = [self.nodes[self.rank].send_state[dst]["count"] for dst in range(all2all_world_size)]
+                # recv_split_sizes = [self.nodes[self.rank].recv_state[src]["count"] for src in range(all2all_world_size)]
+                send_split_sizes = [256 * self.topk for _ in range(all2all_world_size)]
+                recv_split_sizes = [256 * self.topk for _ in range(all2all_world_size)]
+                send_split_sizes[self.rank] = 0
+                recv_split_sizes[self.rank] = 0
+
                 print(f"Rank {self.rank} send_split_sizes: {send_split_sizes}, recv_split_sizes: {recv_split_sizes}")
                 send_tensor = torch.zeros((sum(send_split_sizes), self.hidden_size), dtype=self.dtype, device=self.device)
                 recv_tensor = torch.zeros((sum(recv_split_sizes), self.hidden_size), dtype=self.dtype, device=self.device)
