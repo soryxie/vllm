@@ -3,10 +3,11 @@ import re
 import json
 import glob
 import argparse
+from matplotlib.pylab import f
 import numpy as np
 import matplotlib.pyplot as plt
 
-def read_files():
+def read_files(k=2, reuse=60, only_all2all=True):
     layer_times = []
     with open("./profile_json/compute.jsonl", "r") as f:
         lines = f.readlines()
@@ -15,7 +16,7 @@ def read_files():
             layer_times.append(data)
 
     all2all_times = []
-    with open("./profile_json/moe_profile_8card.jsonl", "r") as f:
+    with open(f"./profile_json/K_{k}_REUSE_{reuse}_{'ALL2ALL' if only_all2all else 'ALLFLOW'}.jsonl", "r") as f:
         lines = f.readlines()
         for line in lines:
             data = json.loads(line.strip())
@@ -24,32 +25,34 @@ def read_files():
     return layer_times, all2all_times
 
 def main():
-    layer_times, all2all_times = read_files()
+    for k in [2, 4]:
+        for reuse in [60, 80]:
+            all2all_time_cache = None
+            for only_all2all in [True, False]:
+                layer_times, all2all_times = read_files(k=k, reuse=reuse, only_all2all=only_all2all)
 
-    i = 0
-    attn = []
-    mlp = []
-    all2all_comm = []
-    native_comm = []
-    for i, layer, all2all in zip(range(len(layer_times)), layer_times, all2all_times):
-        attn.append(layer["attn"])
-        mlp.append(layer["mlp"])
-        native_comm.append(layer["all2all"])
-        all2all_comm.append(all2all["time_ms"])
+                layer_time_0 = layer_times[0]
+                all2all_times = all2all_times[1:]
+                attn, mlp, native_comm = layer_time_0["attn"], layer_time_0["mlp"], layer_time_0["all2all"]
+                all2all = []
+                for all2all_time in all2all_times:
+                    all2all.append(all2all_time["time"])
+                all2all = sum(all2all) / len(all2all_times)
 
-    attn_sum = sum(attn)
-    mlp_sum = sum(mlp)
-    native_comm_sum = sum(native_comm)
-    all2all_comm_sum = sum(all2all_comm) / 2
+                colors = ['#8dd3c7', '#bebada', '#fb8072']
+                plt.figure()
+                plt.pie([attn, mlp, all2all] \
+                    , labels=[f'Attention {attn:.4f}', f'MLP {mlp:.4f}', f'All2All {all2all:.4f}']
+                    , autopct='%1.1f%%', startangle=90, colors=colors)
+                plt.title(f'Time breakdown K={k} Reuse={reuse} {"All2All" if only_all2all else "AllFlow"}')
+                plt.axis('equal')
+                plt.savefig(f"time_breakdown_K_{k}_REUSE_{reuse}_{'ALL2ALL' if only_all2all else 'ALLFLOW'}.png")
 
-    colors = ['#8dd3c7', '#bebada', '#fb8072']
-    plt.pie([attn_sum, mlp_sum, all2all_comm_sum] \
-        , labels=[f'Attention {attn_sum*1000:.2f}ms', f'MLP {mlp_sum*1000:.2f}ms', f'All2All {all2all_comm_sum*1000:.2f}ms']
-        , autopct='%1.1f%%', startangle=90, colors=colors)
-    plt.title('Time breakdown')
-    plt.axis('equal')
-    plt.savefig('time_breakdown.png')
-    print(f"all2all to native_comm ratio: {all2all_comm_sum / native_comm_sum:.2f}")
+                if only_all2all:
+                    all2all_time_cache = all2all
+                else:
+                    print(f"K={k} Reuse={reuse} AllFlow Enlarge All2All time from {all2all_time_cache:.4f} to {all2all:.4f}, ratio: {all2all/all2all_time_cache:.4f}")
+
 
 if __name__ == "__main__":
     main()
