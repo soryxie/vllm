@@ -1,0 +1,30 @@
+{
+    "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "all_flow": {
+        "all2all": 23.9879,
+        "p2p": 25.6254,
+        "reuse": 4.5828,
+        "other": [21.9636, 21.7659, 21.4559, 21.1285],
+    },
+    "only" {
+        "all2all": ,
+        "p2p": ,
+        "reuse": ,
+        "other": [],
+    }
+},
+{
+    "model": "mistralai/Mixtral-8x22B-Instruct-v0.1",
+    "all_flow": {
+        "all2all": 12.3795,
+        "p2p": 19.3652,
+        "reuse": 4.7245,
+        "other": [14.8995, 14.4724, 14.4001, 14.0284],
+    },
+    "only" {
+        "all2all": ,
+        "p2p": ,
+        "reuse": ,
+        "other": [],
+    }
+},
