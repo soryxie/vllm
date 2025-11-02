@@ -387,7 +387,7 @@ class Qwen3MoeModel(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens")
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            3,
             lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config,
                                                 prefix=prefix),
             prefix=f"{prefix}.layers",

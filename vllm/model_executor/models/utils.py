@@ -148,6 +148,14 @@ class AutoWeightsLoader:
         return ".".join((prefix, rest))
 
     def _can_skip(self, qualname: str) -> bool:
+        parts = qualname.split(".")
+        if len(parts) > 2 and parts[0] == "model" and parts[1] == "layers":
+            try:
+                layer_num = int(parts[2])
+                if layer_num >= 3:
+                    return True
+            except ValueError:
+                pass
         return (any(qualname.startswith(p) for p in self.skip_prefixes)
                 or any(substr in qualname for substr in self.skip_substrs))
 
