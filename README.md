@@ -5,5 +5,7 @@
 
 ### Parameters
 VLLM_ATTENTION_BACKEND=RING_FLASH_ATTN设置使用 ringattention
+
 --context-parallel-size
+
 --enforce-eager #目前不支持 cuda graph，必须关闭cuda graph
