@@ -3803,8 +3803,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
 
         # Add `is_profile` here to pre-allocate communication buffers
+        # Profile runs happen before KV cache initialization. Avoid forcing
+        # attention metadata here to prevent referencing kv_cache_config.
+        force_attention = False
+
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens,
+            is_profile=True,
+            force_attention=force_attention,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -3965,7 +3971,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # if we want to warm up attention or not. This is
                 # different from the case where `FULL` implies capture
                 # attention while `PIECEWISE` implies no attention.
-                force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                force_attention = (
+                    cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    or self.parallel_config.context_parallel_size > 1
+                )
                 self._dummy_run(
                     num_tokens,
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
@@ -3979,6 +3988,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._dummy_run(
                 num_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                force_attention=(
+                    cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    or self.parallel_config.context_parallel_size > 1
+                ),
                 uniform_decode=uniform_decode,
                 allow_microbatching=allow_microbatching,
                 skip_eplb=True,

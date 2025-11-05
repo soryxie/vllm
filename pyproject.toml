@@ -303,3 +303,4 @@ windo = "windo"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
+prerelease = "allow"

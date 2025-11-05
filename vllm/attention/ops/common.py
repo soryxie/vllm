@@ -91,13 +91,18 @@ class CPTritonContext:
     """The CPTritonContext is used to avoid recompilation of the Triton JIT."""
 
     def __init__(self):
+        # Note: a previous version attempted to cache a compiled kernel object
+        # and reuse it with different runtime/meta arguments. This can lead to
+        # Triton launch argument mismatches (e.g. "function takes N args (M given)")
+        # when shapes/dtypes/meta change across calls. For correctness and
+        # robustness across driver/Triton versions, we avoid caching here and
+        # let Triton re-specialize per call as needed.
         self.inner_kernel = None
 
     def call_kernel(self, kernel, grid, *regular_args, **const_args):
-        if self.inner_kernel is None:
-            self.inner_kernel = kernel[grid](*regular_args, **const_args)
-        else:
-            self.inner_kernel[grid](*regular_args)
+        # Always invoke with explicit meta to ensure the kernel is specialized
+        # with the correct compile-time constants for this call.
+        kernel[grid](*regular_args, **const_args)
 
 
 def correct_attn_out(

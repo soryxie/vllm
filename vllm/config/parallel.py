@@ -72,6 +72,8 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
+    context_parallel_size: int = 1
+    """Number of context parallel groups."""
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
@@ -212,7 +214,7 @@ class ParallelConfig:
     calls."""
 
     world_size: int = Field(init=False)
-    """world_size is TPxPP, it affects the number of workers we create."""
+    """world_size is TPxCPxPP, it affects the number of workers we create."""
 
     rank: int = 0
     """Global rank in distributed setup."""
@@ -411,6 +413,7 @@ class ParallelConfig:
         factors: list[Any] = []
         factors.append(self.pipeline_parallel_size)
         factors.append(self.tensor_parallel_size)
+        factors.append(self.context_parallel_size)
         factors.append(self.enable_expert_parallel)
         factors.append(self.data_parallel_size)
         factors.append(self.all2all_backend)
@@ -468,7 +471,8 @@ class ParallelConfig:
             )
 
         # Continue with the rest of the initialization
-        self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size
+        self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size * \
+            self.context_parallel_size
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")

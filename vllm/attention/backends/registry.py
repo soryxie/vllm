@@ -9,6 +9,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 class _Backend(enum.Enum):
     FLASH_ATTN = enum.auto()
+    RING_FLASH_ATTN = enum.auto()
     TRITON_ATTN = enum.auto()
     XFORMERS = enum.auto()
     ROCM_ATTN = enum.auto()
@@ -32,6 +33,7 @@ class _Backend(enum.Enum):
 
 BACKEND_MAP = {
     _Backend.FLASH_ATTN: "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend",  # noqa: E501
+    _Backend.RING_FLASH_ATTN: "vllm.v1.attention.backends.ring_flash_attn.RingFlashAttentionBackend",  # noqa: E501
     _Backend.TRITON_ATTN: "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend",  # noqa: E501
     _Backend.XFORMERS: "vllm.v1.attention.backends.xformers.XFormersAttentionBackend",  # noqa: E501
     _Backend.ROCM_ATTN: "vllm.v1.attention.backends.rocm_attn.RocmAttentionBackend",  # noqa: E501

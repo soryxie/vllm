@@ -354,6 +354,9 @@ class CudaPlatformBase(Platform):
             FLASH_ATTN_V1 = (
                 "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"  # noqa: E501
             )
+            RING_FLASH_ATTN_V1 = (
+                "vllm.v1.attention.backends.ring_flash_attn.RingFlashAttentionBackend"  # noqa: E501
+            )
             TREE_ATTN_V1 = "vllm.v1.attention.backends.tree_attn.TreeAttentionBackend"  # noqa: E501
             XFORMERS_V1 = "vllm.v1.attention.backends.xformers.XFormersAttentionBackend"  # noqa: E501
 
@@ -377,6 +380,9 @@ class CudaPlatformBase(Platform):
             elif selected_backend == _Backend.FLASH_ATTN:
                 logger.info_once("Using Flash Attention backend on V1 engine.")
                 return FLASH_ATTN_V1
+            elif selected_backend == _Backend.RING_FLASH_ATTN:
+                logger.info_once("Using Ring FlashAttention backend on V1 engine.")
+                return RING_FLASH_ATTN_V1
             elif selected_backend == _Backend.TREE_ATTN:
                 logger.info_once("Using Tree Attention backend on V1 engine.")
                 return TREE_ATTN_V1
