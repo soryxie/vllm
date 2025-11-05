@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -471,6 +472,10 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
 
         ring_ctx = _RingContext()
         world_size = cp_group.world_size
+        # 通信占比计算
+        e2e_start = time.perf_counter()
+        send_wall_total = 0.0
+        recv_wall_total = 0.0
         curr_k = local_key
         curr_v = local_value
         curr_seq_lens = attn_metadata.cp_seq_lens_cpu.to(
@@ -580,13 +585,21 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
                     if isinstance(_t, torch.Tensor):
                         total_sent_bytes += _t.element_size() * _t.numel()
 
-            # 避免死锁，交替send和recv
+            # 不能同时send和recv，否则死锁
             if (cp_rank % 2) == 0:
+                t0 = time.perf_counter()
                 recv_dict = ring_comm.recv()
+                recv_wall_total += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 ring_comm.send(payload)
+                send_wall_total += time.perf_counter() - t0
             else:
+                t0 = time.perf_counter()
                 ring_comm.send(payload)
+                send_wall_total += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 recv_dict = ring_comm.recv()
+                recv_wall_total += time.perf_counter() - t0
             if not recv_dict:
                 break
             curr_k = recv_dict["k"].contiguous()
@@ -665,6 +678,27 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
             final_out = final_out.contiguous()
 
         output.index_copy_(0, token_indices, final_out)
+
+        torch.cuda.synchronize()
+        e2e_ms = (time.perf_counter() - e2e_start) * 1e3
+        send_ms = send_wall_total * 1e3
+        recv_ms = recv_wall_total * 1e3
+        comm_ms = send_ms + recv_ms
+        pct = (lambda x: (x / e2e_ms * 100.0) if e2e_ms > 0 else 0.0)
+        logger.info(
+            "RingFA timing | rank=%d/%d | e2e=%.3f ms | send=%.3f ms (%.1f%%) | recv=%.3f ms (%.1f%%) | comm=%.3f ms (%.1f%%) | sent=%.2fMB | recv=%.2fMB",
+            cp_rank,
+            world_size,
+            e2e_ms,
+            send_ms,
+            pct(send_ms),
+            recv_ms,
+            pct(recv_ms),
+            comm_ms,
+            pct(comm_ms),
+            total_sent_bytes / 1e6,
+            total_recv_bytes / 1e6,
+        )
         logger.debug(
             "RingFA writeback | rank=%d/%d | token_indices=%d | output.shape=%s",
             cp_rank,
