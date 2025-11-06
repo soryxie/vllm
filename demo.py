@@ -1,16 +1,29 @@
+import os
+
+import torch
 import torch.distributed as dist
-# import torch
 
-dist.init_process_group(backend='nccl', world_size=4, rank=0)
+dist.init_process_group(backend="nccl")
 
-default_pg = dist.distributed_c10d._get_default_group()
-print(default_pg)
+rank = dist.get_rank()
+world_size = dist.get_world_size()
 
-# 创建新的组， 只包含部分进程
-new_pg = dist.new_group(ranks=[0, 1])
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+device = torch.device(f"cuda:{local_rank}")
 
-# 在新组中执行通信
-tensor = torch.ones(2).cuda()
-dist.all_reduce(tensor, group=new_pg)
-print(tensor)
+send_tensor = (torch.arange(2, dtype=torch.float32, device=device)
+               + 2 * rank)
+recv_tensor = torch.empty(2, dtype=torch.float32, device=device)
 
+send_op = dist.P2POp(dist.isend, send_tensor, (rank + 1) % world_size)
+recv_op = dist.P2POp(dist.irecv, recv_tensor, (rank - 1 + world_size) % world_size)
+
+reqs = dist.batch_isend_irecv([send_op, recv_op])
+for r in reqs:
+    r.wait()
+
+torch.cuda.synchronize(device)
+print(f"Rank {rank} received:", recv_tensor)
+
+dist.destroy_process_group()

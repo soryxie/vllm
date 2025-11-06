@@ -1,10 +1,12 @@
 ## Context Parallelism
 ```bash
- VLLM_ATTENTION_BACKEND=RING_FLASH_ATTN VLLM_LOGGING_LEVEL=INFO uv run vllm serve /home/ch/model/Llama-3.1-8B-Instruct --context-parallel-size 2 --enforce-eager --no-enable-prefix-caching
+VLLM_ATTENTION_BACKEND=RING_FLASH_ATTN VLLM_LOGGING_LEVEL=INFO uv run vllm serve /home/ch/model/Llama-3.1-8B-Instruct --context-parallel-size 2 --enforce-eager --max-model-len 32000 --gpu-memory-utilization 0.7 --no-enable-prefix-caching
  ```
 
 ### Parameters
 VLLM_ATTENTION_BACKEND=RING_FLASH_ATTN设置使用 ringattention
+
+
 
 --context-parallel-size
 

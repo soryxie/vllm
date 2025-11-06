@@ -476,14 +476,33 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
         e2e_start = time.perf_counter()
         send_wall_total = 0.0
         recv_wall_total = 0.0
+        comm_wall_total = 0.0
         curr_k = local_key
         curr_v = local_value
-        curr_seq_lens = attn_metadata.cp_seq_lens_cpu.to(
-            device=query.device, dtype=torch.int32
-        ).contiguous()
-        curr_seq_starts = attn_metadata.cp_seq_starts_cpu.to(
-            device=query.device, dtype=torch.int32
-        ).contiguous()
+        cp_rank = cp_group.rank_in_group
+        owner_rank = cp_rank
+
+        cp_seq_lens_all_cpu = attn_metadata.cp_seq_lens_all_ranks.to(torch.int32)
+        cp_seq_lens_all = cp_seq_lens_all_cpu.to(device=query.device)
+
+        # [3, 5, 0, 2]
+        # [3, 8, 8, 10]
+        # [0, 3, 8, 8] 每个 rank 对应的 token 起始下标
+        cp_seq_starts_all_cpu = torch.cumsum(
+            cp_seq_lens_all_cpu, dim=0, dtype=torch.int32
+        ) - cp_seq_lens_all_cpu
+
+        cp_seq_starts_all = cp_seq_starts_all_cpu.to(device=query.device)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            assert torch.equal(
+                cp_seq_starts_all_cpu[cp_rank], attn_metadata.cp_seq_starts_cpu
+            ), "local seq starts mismatch"
+
+
+        curr_seq_lens = cp_seq_lens_all[cp_rank].contiguous()
+        curr_seq_starts = cp_seq_starts_all[cp_rank].contiguous()
+        
         q_seq_starts = curr_seq_starts.clone()
         q_seq_lens = curr_seq_lens.clone()
         q_seq_ends = q_seq_starts + q_seq_lens
@@ -491,9 +510,6 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
         cu_seqlens_q = attn_metadata.cp_query_start_loc.to(query.device)
         max_seqlen_q = int(attn_metadata.cp_seq_lens_cpu.max().item())
         ring_comm = RingComm(cp_group)
-
-        cp_rank = cp_group.rank_in_group
-        owner_rank = cp_rank
 
         logger.debug_once(
             "RingFA forward begin | rank=%d/%d | local_tokens=%d | num_reqs=%d | max_seqlen_q=%d | q.shape=%s k.shape=%s v.shape=%s",  # noqa: E501
@@ -510,6 +526,12 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
         ring_steps = 0
         total_sent_bytes = 0
         total_recv_bytes = 0
+        device_group = cp_group.device_group
+        assert device_group is not None, "device_group is required for async P2P"
+
+        send_peer = cp_group.ranks[ring_comm.next_rank]
+        recv_peer = cp_group.ranks[ring_comm.prev_rank]
+
         for _ in range(world_size):
             token_count = int(curr_seq_lens.sum().item())
             if token_count > 0:
@@ -573,50 +595,64 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
                 tuple(curr_v.shape),
             )
 
-            payload = {
-                "k": curr_k,
-                "v": curr_v,
-                "seq_lens": curr_seq_lens,
-                "seq_starts": curr_seq_starts,
-            }
-            # 统计发送的字节数
-            if logger.isEnabledFor(logging.DEBUG):
-                for _name, _t in payload.items():
-                    if isinstance(_t, torch.Tensor):
-                        total_sent_bytes += _t.element_size() * _t.numel()
+            # 异步 P2P  K/V
+            next_owner = (owner_rank - 1 + world_size) % world_size
+            recv_seq_lens = cp_seq_lens_all[next_owner].contiguous()
+            recv_seq_starts = cp_seq_starts_all[next_owner].contiguous()
 
-            # 不能同时send和recv，否则死锁
-            if (cp_rank % 2) == 0:
-                t0 = time.perf_counter()
-                recv_dict = ring_comm.recv()
-                recv_wall_total += time.perf_counter() - t0
-                t0 = time.perf_counter()
-                ring_comm.send(payload)
-                send_wall_total += time.perf_counter() - t0
-            else:
-                t0 = time.perf_counter()
-                ring_comm.send(payload)
-                send_wall_total += time.perf_counter() - t0
-                t0 = time.perf_counter()
-                recv_dict = ring_comm.recv()
-                recv_wall_total += time.perf_counter() - t0
-            if not recv_dict:
-                break
-            curr_k = recv_dict["k"].contiguous()
-            curr_v = recv_dict["v"].contiguous()
-            curr_seq_lens = recv_dict["seq_lens"].to(
-                device=query.device, dtype=torch.int32
-            ).contiguous()
-            curr_seq_starts = recv_dict["seq_starts"].to(
-                device=query.device, dtype=torch.int32
-            ).contiguous()
-            # 统计接收的字节数
-            if logger.isEnabledFor(logging.DEBUG):
-                for _name, _t in recv_dict.items():
-                    if isinstance(_t, torch.Tensor):
-                        total_recv_bytes += _t.element_size() * _t.numel()
+            recv_token_count = int(recv_seq_lens.sum().item())
 
-            owner_rank = (owner_rank - 1 + world_size) % world_size
+            total_sent_bytes += curr_k.element_size() * curr_k.numel()
+            total_sent_bytes += curr_v.element_size() * curr_v.numel()
+
+            recv_shape = (recv_token_count, self.num_heads, self.head_size)
+            k_recv = torch.empty(
+                recv_shape,
+                dtype=curr_k.dtype,
+                device=curr_k.device,
+            )
+            v_recv = torch.empty(
+                recv_shape,
+                dtype=curr_v.dtype,
+                device=curr_v.device,
+            )
+
+            # 异步通信计时
+            torch.cuda.synchronize(curr_k.device)
+            comm_start = time.perf_counter()
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.isend, curr_k.contiguous(), send_peer, device_group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.isend, curr_v.contiguous(), send_peer, device_group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, k_recv, recv_peer, device_group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, v_recv, recv_peer, device_group
+                ),
+            ]
+            reqs = torch.distributed.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+            torch.cuda.synchronize(curr_k.device)
+            comm_wall = time.perf_counter() - comm_start
+            comm_wall_total += comm_wall
+            # half
+            send_wall_total += comm_wall * 0.5
+            recv_wall_total += comm_wall * 0.5
+
+            total_recv_bytes += k_recv.element_size() * k_recv.numel()
+            total_recv_bytes += v_recv.element_size() * v_recv.numel()
+
+            curr_k = k_recv.contiguous()
+            curr_v = v_recv.contiguous()
+            curr_seq_lens = recv_seq_lens
+            curr_seq_starts = recv_seq_starts
+
+            owner_rank = next_owner
             ring_steps += 1
 
         final_out = ring_ctx.result(query.dtype)
@@ -683,7 +719,7 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
         e2e_ms = (time.perf_counter() - e2e_start) * 1e3
         send_ms = send_wall_total * 1e3
         recv_ms = recv_wall_total * 1e3
-        comm_ms = send_ms + recv_ms
+        comm_ms = comm_wall_total * 1e3
         pct = (lambda x: (x / e2e_ms * 100.0) if e2e_ms > 0 else 0.0)
         logger.info(
             "RingFA timing | rank=%d/%d | e2e=%.3f ms | send=%.3f ms (%.1f%%) | recv=%.3f ms (%.1f%%) | comm=%.3f ms (%.1f%%) | sent=%.2fMB | recv=%.2fMB",
