@@ -284,6 +284,31 @@ class _RingContext:
         return self.lse.squeeze(-1).to(torch.float32)
 
 
+@dataclass
+class _PendingRingTransfer:
+    requests: list[torch.distributed.Work]
+    k_buffer: torch.Tensor
+    v_buffer: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_starts: torch.Tensor
+    owner_rank: int
+    start_time: float
+    recv_bytes: int
+
+    def wait(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, float, int]:
+        for req in self.requests:
+            req.wait()
+        return (
+            self.k_buffer,
+            self.v_buffer,
+            self.seq_lens,
+            self.seq_starts,
+            self.owner_rank,
+            time.perf_counter() - self.start_time,
+            self.recv_bytes,
+        )
+
+
 class RingComm:
     """wrapper over GroupCoordinator."""
 
@@ -436,7 +461,7 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
         local_key = key.index_select(0, token_indices).contiguous()
         local_value = value.index_select(0, token_indices).contiguous()
         # Log local/global Q/K/V shapes per CP rank for troubleshooting
-        logger.info(
+        logger.debug(
             "RingFA shapes | cp_rank=%d/%d | q_full=%s q_local=%s | k_local=%s v_local=%s",
             get_cp_group().rank_in_group,
             get_cp_group().world_size,
@@ -450,7 +475,7 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
 
         key_cache, value_cache = kv_cache.unbind(0)
         # Log KV cache buffer shapes per CP rank
-        logger.info(
+        logger.debug(
             "KV cache buffers | cp_rank=%d/%d | key_cache=%s | value_cache=%s | slot_map=%s",
             get_cp_group().rank_in_group,
             get_cp_group().world_size,
@@ -531,8 +556,80 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
 
         send_peer = cp_group.ranks[ring_comm.next_rank]
         recv_peer = cp_group.ranks[ring_comm.prev_rank]
+        pending_transfer: _PendingRingTransfer | None = None
 
-        for _ in range(world_size):
+        def launch_transfer(
+            curr_k_tensor: torch.Tensor,
+            curr_v_tensor: torch.Tensor,
+            owner: int,
+        ) -> _PendingRingTransfer:
+            nonlocal total_sent_bytes
+            next_owner = (owner - 1 + world_size) % world_size
+            recv_seq_lens = cp_seq_lens_all[next_owner].contiguous()
+            recv_seq_starts = cp_seq_starts_all[next_owner].contiguous()
+            recv_token_count = int(recv_seq_lens.sum().item())
+            recv_shape = (
+                recv_token_count,
+                self.num_heads,
+                self.head_size,
+            )
+            k_recv = torch.empty(
+                recv_shape,
+                dtype=curr_k_tensor.dtype,
+                device=curr_k_tensor.device,
+            )
+            v_recv = torch.empty(
+                recv_shape,
+                dtype=curr_v_tensor.dtype,
+                device=curr_v_tensor.device,
+            )
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    curr_k_tensor.contiguous(),
+                    send_peer,
+                    device_group,
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    curr_v_tensor.contiguous(),
+                    send_peer,
+                    device_group,
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    k_recv,
+                    recv_peer,
+                    device_group,
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    v_recv,
+                    recv_peer,
+                    device_group,
+                ),
+            ]
+            total_sent_bytes += curr_k_tensor.element_size() * curr_k_tensor.numel()
+            total_sent_bytes += curr_v_tensor.element_size() * curr_v_tensor.numel()
+            recv_bytes = k_recv.element_size() * k_recv.numel()
+            recv_bytes += v_recv.element_size() * v_recv.numel()
+            start = time.perf_counter()
+            requests = torch.distributed.batch_isend_irecv(ops)
+            return _PendingRingTransfer(
+                requests=requests,
+                k_buffer=k_recv,
+                v_buffer=v_recv,
+                seq_lens=recv_seq_lens,
+                seq_starts=recv_seq_starts,
+                owner_rank=next_owner,
+                start_time=start,
+                recv_bytes=recv_bytes,
+            )
+
+        if world_size > 1:
+            pending_transfer = launch_transfer(curr_k, curr_v, owner_rank)
+
+        for step in range(world_size):
             token_count = int(curr_seq_lens.sum().item())
             if token_count > 0:
                 chunk_seq_starts = curr_seq_starts
@@ -584,76 +681,50 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
             if world_size == 1:
                 break
 
-            # log current local KV slice shapes for this ring step
-            logger.debug(
-                "RingFA step | cp_rank=%d/%d | step=%d/%d | curr_k=%s curr_v=%s",
-                cp_rank,
-                world_size,
-                ring_steps,
-                world_size,
-                tuple(curr_k.shape),
-                tuple(curr_v.shape),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "RingFA step | cp_rank=%d/%d | step=%d/%d | owner=%d | curr_k=%s curr_v=%s",
+                    cp_rank,
+                    world_size,
+                    ring_steps,
+                    world_size,
+                    owner_rank,
+                    tuple(curr_k.shape),
+                    tuple(curr_v.shape),
+                )
 
-            # 异步 P2P  K/V
-            next_owner = (owner_rank - 1 + world_size) % world_size
-            recv_seq_lens = cp_seq_lens_all[next_owner].contiguous()
-            recv_seq_starts = cp_seq_starts_all[next_owner].contiguous()
+            if pending_transfer is None:
+                raise RuntimeError
 
-            recv_token_count = int(recv_seq_lens.sum().item())
+            # 等待通信完成
+            (
+                next_k,
+                next_v,
+                next_seq_lens,
+                next_seq_starts,
+                next_owner,
+                comm_wall,
+                recv_bytes,
+            ) = pending_transfer.wait()
 
-            total_sent_bytes += curr_k.element_size() * curr_k.numel()
-            total_sent_bytes += curr_v.element_size() * curr_v.numel()
-
-            recv_shape = (recv_token_count, self.num_heads, self.head_size)
-            k_recv = torch.empty(
-                recv_shape,
-                dtype=curr_k.dtype,
-                device=curr_k.device,
-            )
-            v_recv = torch.empty(
-                recv_shape,
-                dtype=curr_v.dtype,
-                device=curr_v.device,
-            )
-
-            # 异步通信计时
-            torch.cuda.synchronize(curr_k.device)
-            comm_start = time.perf_counter()
-            ops = [
-                torch.distributed.P2POp(
-                    torch.distributed.isend, curr_k.contiguous(), send_peer, device_group
-                ),
-                torch.distributed.P2POp(
-                    torch.distributed.isend, curr_v.contiguous(), send_peer, device_group
-                ),
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, k_recv, recv_peer, device_group
-                ),
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, v_recv, recv_peer, device_group
-                ),
-            ]
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-            torch.cuda.synchronize(curr_k.device)
-            comm_wall = time.perf_counter() - comm_start
             comm_wall_total += comm_wall
-            # half
             send_wall_total += comm_wall * 0.5
             recv_wall_total += comm_wall * 0.5
+            total_recv_bytes += recv_bytes
 
-            total_recv_bytes += k_recv.element_size() * k_recv.numel()
-            total_recv_bytes += v_recv.element_size() * v_recv.numel()
-
-            curr_k = k_recv.contiguous()
-            curr_v = v_recv.contiguous()
-            curr_seq_lens = recv_seq_lens
-            curr_seq_starts = recv_seq_starts
-
+            # 更新当前的 k 和 v
+            curr_k = next_k.contiguous()
+            curr_v = next_v.contiguous()
+            curr_seq_lens = next_seq_lens
+            curr_seq_starts = next_seq_starts
             owner_rank = next_owner
+
             ring_steps += 1
+
+            if ring_steps < world_size:
+                pending_transfer = launch_transfer(curr_k, curr_v, owner_rank)
+            else:
+                pending_transfer = None
 
         final_out = ring_ctx.result(query.dtype)
         final_lse = ring_ctx.result_lse()
@@ -667,7 +738,6 @@ class RingFlashAttentionImpl(FlashAttentionImpl):
             tuple(final_lse.shape),
         )
 
-        
         logger.debug(
             "RingFA comm summary | rank=%d/%d | ring_steps=%d | sent=%.2fMB | recv=%.2fMB",
             cp_rank,
