@@ -30,6 +30,27 @@ class NaiveAll2AllManager(All2AllManagerBase):
     def __init__(self, cpu_group):
         super().__init__(cpu_group)
 
+    def set_global_expert_map(
+        self,
+        ep_size: int,
+        global_num_experts: int,
+        dtype: torch.dtype = torch.int32,
+        device = torch.device("cuda")
+    ) -> torch.Tensor:
+        assert ep_size > 0
+        if ep_size == 1:
+            return torch.zeros(global_num_experts, dtype=dtype, device=device)
+
+        base = global_num_experts // ep_size
+        global2ep = torch.empty(global_num_experts, dtype=dtype, device=device)
+        for ep_rank in range(ep_size - 1):
+            start = ep_rank * base
+            end = (ep_rank + 1) * base
+            global2ep[start:end] = ep_rank
+
+        global2ep[(ep_size - 1) * base:] = ep_size - 1
+        self.global2ep = global2ep
+
     def naive_multicast(self, x: torch.Tensor,
                         cu_tokens_across_dp_cpu: torch.Tensor):
         assert (len(x.shape) == 2)
@@ -47,16 +68,91 @@ class NaiveAll2AllManager(All2AllManagerBase):
             self.dp_group.broadcast(buffer[start:end, :], idx)
 
         return buffer
+    
+    def all2all(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+    ):
+        _, topk_ids = torch.topk(router_logits,
+                                            top_k,
+                                            dim=-1)
+
+        # Map the expert IDs to the EP ranks.
+        if self.global2ep is not None:
+            ep2ranks = self.global2ep[topk_ids]
+        else:
+            ep2ranks = topk_ids
+
+        # Count the number of tokens to be sent to each EP rank.
+        send_counts = torch.zeros(self.world_size,
+                                  dtype=torch.long,
+                                  device=hidden_states.device)
+        for i in range(self.world_size):
+            send_counts[i] = (ep2ranks == i).sum()
+        logger.info(f"rank: {self.dp_group.rank}, send_counts: {send_counts}")
+
+        # Exchange the send counts to get the receive counts.
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts,
+                               send_counts,
+                               group=self.dp_group.device_group)
+        logger.info(f"rank: {self.dp_group.rank}, recv_counts: {recv_counts}")
+
+        # Re-arrange send tensor by rank
+        dest_ranks = ep2ranks.reshape(-1)
+        N = hidden_states.size(0)
+        K = top_k
+        device = hidden_states.device
+        token_idx = torch.arange(N, device=device).repeat_interleave(K)
+        order = torch.argsort(dest_ranks, stable=True)
+
+        send_index = token_idx.index_select(0, order)
+        send_hidden_states = hidden_states.index_select(0, send_index)
+        send_router_logits = router_logits.index_select(0, send_index)
+
+        # 6. Prepare the output buffers.
+        recv_hidden_states = torch.empty(
+            (sum(recv_counts), hidden_states.size(1)),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device)
+        recv_router_logits = torch.empty(
+            (sum(recv_counts), router_logits.size(1)),
+            dtype=router_logits.dtype,
+            device=router_logits.device)
+
+        # 7. Perform the all-to-all communication.
+        dist.all_to_all_single(
+            recv_hidden_states,
+            send_hidden_states,
+            output_split_sizes=recv_counts.tolist(),
+            input_split_sizes=send_counts.tolist(),
+            group=self.dp_group.device_group)
+        dist.all_to_all_single(
+            recv_router_logits,
+            send_router_logits,
+            output_split_sizes=recv_counts.tolist(),
+            input_split_sizes=send_counts.tolist(),
+            group=self.dp_group.device_group)
+
+        return recv_hidden_states, recv_router_logits
 
     def dispatch(self, hidden_states: torch.Tensor,
                  router_logits: torch.Tensor):
         cu_tokens_across_dp_cpu = get_forward_context(
         ).dp_metadata.cu_tokens_across_dp_cpu
 
-        hidden_states = self.naive_multicast(hidden_states,
-                                             cu_tokens_across_dp_cpu)
-        router_logits = self.naive_multicast(router_logits,
-                                             cu_tokens_across_dp_cpu)
+        # previous:
+        # hidden_states = self.naive_multicast(hidden_states,
+        #                                      cu_tokens_across_dp_cpu)
+        # router_logits = self.naive_multicast(router_logits,
+        #                                      cu_tokens_across_dp_cpu)
+        hidden_states, router_logits = self.all2all(
+            hidden_states,
+            router_logits,
+            top_k=self.top_k,
+        )
         return hidden_states, router_logits
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -677,6 +677,11 @@ class FusedMoE(torch.nn.Module):
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts)
+            # set global expert map
+            get_ep_group().device_communicator.all2all_manager.set_global_expert_map(
+                ep_size=self.ep_size,
+                global_num_experts=self.global_num_experts)
+            get_ep_group().device_communicator.all2all_manager.top_k = top_k
         else:
             self.local_num_experts, self.expert_map = (self.global_num_experts,
                                                        None)
