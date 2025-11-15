@@ -19,6 +19,72 @@ else:
     FusedMoE = None
 
 
+TOKEN_DISTRIBUTION = [
+    [9810, 5338, 1231, 3042, 4452, 2004, 841, 6050],
+    [9278, 6282, 839, 3722, 3821, 2903, 909, 5014],
+    [10684, 5165, 1044, 2634, 4344, 3333, 675, 4889],
+    [10897, 5629, 1086, 2114, 2762, 3463, 1059, 5758],
+    [8684, 5666, 1046, 3955, 4334, 2952, 944, 5187],
+    [8361, 5908, 777, 3043, 3984, 3422, 897, 6376],
+    [10208, 5507, 1117, 4148, 3967, 3119, 904, 3798],
+    [9781, 5211, 902, 3343, 4289, 2839, 1008, 5395],
+]
+
+
+def _scale_distribution(base_distribution: list[int], target_total: int) -> list[int]:
+    """Scale base_distribution to sum to target_total while keeping proportions."""
+    length = len(base_distribution)
+    if length == 0:
+        return []
+    if target_total == 0:
+        return [0] * length
+    base_total = sum(base_distribution)
+    if base_total == 0:
+        base_distribution = [1] * length
+        base_total = length
+
+    scaled = [value * target_total / base_total for value in base_distribution]
+    floored = [int(value) for value in scaled]
+    remainder = target_total - sum(floored)
+    if remainder <= 0:
+        return floored
+
+    fractional = [(idx, scaled[idx] - floored[idx]) for idx in range(length)]
+    fractional.sort(key=lambda item: (-item[1], item[0]))
+    for idx in range(remainder):
+        destination = fractional[idx % length][0]
+        floored[destination] += 1
+    return floored
+
+def map_send_token_sizes_to_ranks(rank: int, world_size: int, total_tokens: int) -> list[int]:
+    if world_size <= 0:
+        raise ValueError("world_size must be positive.")
+    if not (0 <= rank < world_size):
+        raise ValueError(f"rank {rank} must be within [0, {world_size}).")
+    if world_size > len(TOKEN_DISTRIBUTION):
+        raise ValueError("world_size exceeds TOKEN_DISTRIBUTION definitions.")
+
+    base_row = TOKEN_DISTRIBUTION[rank][:world_size]
+    return _scale_distribution(base_row, total_tokens)
+
+
+def map_recv_token_sizes_to_ranks(rank: int, world_size: int, total_tokens: int) -> list[int]:
+    if world_size <= 0:
+        raise ValueError("world_size must be positive.")
+    if not (0 <= rank < world_size):
+        raise ValueError(f"rank {rank} must be within [0, {world_size}).")
+
+    recv_sizes = []
+    for sender_rank in range(world_size):
+        send_distribution = map_send_token_sizes_to_ranks(
+            rank=sender_rank,
+            world_size=world_size,
+            total_tokens=total_tokens,
+        )
+        recv_sizes.append(send_distribution[rank])
+    return recv_sizes
+
+
 class NaiveAll2AllManager(All2AllManagerBase):
     """
     A naive implementation of all2all communication.
@@ -29,27 +95,8 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
     def __init__(self, cpu_group):
         super().__init__(cpu_group)
-
-    def set_global_expert_map(
-        self,
-        ep_size: int,
-        global_num_experts: int,
-        dtype: torch.dtype = torch.int32,
-        device = torch.device("cuda")
-    ) -> torch.Tensor:
-        assert ep_size > 0
-        if ep_size == 1:
-            return torch.zeros(global_num_experts, dtype=dtype, device=device)
-
-        base = global_num_experts // ep_size
-        global2ep = torch.empty(global_num_experts, dtype=dtype, device=device)
-        for ep_rank in range(ep_size - 1):
-            start = ep_rank * base
-            end = (ep_rank + 1) * base
-            global2ep[start:end] = ep_rank
-
-        global2ep[(ep_size - 1) * base:] = ep_size - 1
-        self.global2ep = global2ep
+        self.router_logits: torch.Tensor = None
+        self.all2all_buffer: torch.Tensor = None
 
     def naive_multicast(self, x: torch.Tensor,
                         cu_tokens_across_dp_cpu: torch.Tensor):
@@ -69,101 +116,93 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
         return buffer
     
-    def all2all(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-    ):
-        _, topk_ids = torch.topk(router_logits,
-                                            top_k,
-                                            dim=-1)
+    def all_to_all(self, input_: torch.Tensor, reversed: bool) -> torch.Tensor:
+        world_size = self.dp_group.world_size
+        if world_size == 1:
+            return input_
+        total_send_length = input_.size(0)
+        hidden_size = input_.size(1)
 
-        # Map the expert IDs to the EP ranks.
-        if self.global2ep is not None:
-            ep2ranks = self.global2ep[topk_ids]
+        # 规定每个rank上发送的token数量相同
+        if reversed:
+            send_lengths = map_recv_token_sizes_to_ranks(
+                rank=self.rank,
+                world_size=world_size,
+                total_tokens=total_send_length,
+            )
+            recv_lengths = map_send_token_sizes_to_ranks(
+                rank=self.rank,
+                world_size=world_size,
+                total_tokens=total_send_length,
+            )
         else:
-            ep2ranks = topk_ids
+            send_lengths = map_send_token_sizes_to_ranks(
+                rank=self.rank,
+                world_size=world_size,
+                total_tokens=total_send_length,
+            )
+            recv_lengths = map_recv_token_sizes_to_ranks(
+                rank=self.rank,
+                world_size=world_size,
+                total_tokens=total_send_length,
+            )
+        total_recv_length = sum(recv_lengths)
+        print(f"Rank {self.rank} send lengths: {send_lengths}, recv lengths: {recv_lengths}")
 
-        # Count the number of tokens to be sent to each EP rank.
-        send_counts = torch.zeros(self.world_size,
-                                  dtype=torch.long,
-                                  device=hidden_states.device)
-        for i in range(self.world_size):
-            send_counts[i] = (ep2ranks == i).sum()
-        logger.info(f"rank: {self.dp_group.rank}, send_counts: {send_counts}")
+        # fetch recv buffer
+        if self.all2all_buffer is None or \
+              self.all2all_buffer.size(0) < total_recv_length * hidden_size:
+            self.all2all_buffer = torch.empty(
+                total_recv_length*hidden_size*4,
+                dtype=input_.dtype,
+                device=self.dp_group.device,
+            )
+        recv_buffer = self.all2all_buffer[:total_recv_length*hidden_size].view(-1, hidden_size)
 
-        # Exchange the send counts to get the receive counts.
-        recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts,
-                               send_counts,
-                               group=self.dp_group.device_group)
-        logger.info(f"rank: {self.dp_group.rank}, recv_counts: {recv_counts}")
+        torch.distributed.all_to_all_single(
+            recv_buffer,
+            input_,
+            output_split_sizes=recv_lengths,
+            input_split_sizes=send_lengths,
+            group=self.dp_group.device_group,
+        )
 
-        # Re-arrange send tensor by rank
-        dest_ranks = ep2ranks.reshape(-1)
-        N = hidden_states.size(0)
-        K = top_k
-        device = hidden_states.device
-        token_idx = torch.arange(N, device=device).repeat_interleave(K)
-        order = torch.argsort(dest_ranks, stable=True)
-
-        send_index = token_idx.index_select(0, order)
-        send_hidden_states = hidden_states.index_select(0, send_index)
-        send_router_logits = router_logits.index_select(0, send_index)
-
-        # 6. Prepare the output buffers.
-        recv_hidden_states = torch.empty(
-            (sum(recv_counts), hidden_states.size(1)),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device)
-        recv_router_logits = torch.empty(
-            (sum(recv_counts), router_logits.size(1)),
-            dtype=router_logits.dtype,
-            device=router_logits.device)
-
-        # 7. Perform the all-to-all communication.
-        dist.all_to_all_single(
-            recv_hidden_states,
-            send_hidden_states,
-            output_split_sizes=recv_counts.tolist(),
-            input_split_sizes=send_counts.tolist(),
-            group=self.dp_group.device_group)
-        dist.all_to_all_single(
-            recv_router_logits,
-            send_router_logits,
-            output_split_sizes=recv_counts.tolist(),
-            input_split_sizes=send_counts.tolist(),
-            group=self.dp_group.device_group)
-
-        return recv_hidden_states, recv_router_logits
+        return recv_buffer
 
     def dispatch(self, hidden_states: torch.Tensor,
                  router_logits: torch.Tensor):
-        cu_tokens_across_dp_cpu = get_forward_context(
-        ).dp_metadata.cu_tokens_across_dp_cpu
+        if self.top_k is None or self.global_num_experts is None:
+            raise ValueError(
+                "top_k and global_num_experts must be set before dispatch."
+            )
 
-        # previous:
-        # hidden_states = self.naive_multicast(hidden_states,
-        #                                      cu_tokens_across_dp_cpu)
-        # router_logits = self.naive_multicast(router_logits,
-        #                                      cu_tokens_across_dp_cpu)
-        hidden_states, router_logits = self.all2all(
-            hidden_states,
-            router_logits,
-            top_k=self.top_k,
-        )
-        return hidden_states, router_logits
+        hidden_states = hidden_states.repeat(self.top_k, 1)
+        hidden_states = self.all_to_all(hidden_states, reversed=False)
+
+        num_tokens = hidden_states.shape[0]
+
+        if self.router_logits is None or self.router_logits.shape[0] < num_tokens:
+            ep_local_size = self.global_num_experts // self.dp_group.world_size
+            rank = self.dp_group.rank
+            start = rank * ep_local_size
+            device = router_logits.device
+            num_experts = router_logits.shape[1]
+
+            ep_ids = torch.arange(start, start + ep_local_size, device=device)
+            offsets = torch.arange(self.top_k, device=device)
+            ep_id_matrix = (ep_ids.unsqueeze(1) + offsets) % num_experts
+
+            prob_rows = torch.zeros(ep_local_size, num_experts,
+                                    dtype=router_logits.dtype, device=device)
+            row_idx = torch.arange(ep_local_size, device=device).unsqueeze(1)
+            prob_rows[row_idx, ep_id_matrix] = 1.0
+            repeat_times = num_tokens // ep_local_size + 1
+            self.router_logits = prob_rows.repeat(repeat_times, 1)
+
+        return hidden_states, self.router_logits[:num_tokens]
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        cu_tokens_across_dp_cpu = get_forward_context(
-        ).dp_metadata.cu_tokens_across_dp_cpu
-        start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
-            self.dp_rank - 1]
-        end = cu_tokens_across_dp_cpu[self.dp_rank]
-
-        all_hidden_states = self.dp_group.all_reduce(hidden_states)
-        hidden_states = all_hidden_states[start:end, :]
+        hidden_states = self.all_to_all(hidden_states, reversed=True)
         return hidden_states
 
     def destroy(self):

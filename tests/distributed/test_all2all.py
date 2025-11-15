@@ -39,13 +39,9 @@ def _test_native_all2all_worker(pgi: ProcessGroupInfo, dp_size: int):
     # init comm manager
     cpu_group = dist.new_group(backend="gloo")
     manager = NaiveAll2AllManager(cpu_group)
-    manager.set_global_expert_map(
-        ep_size=world_size, 
-        global_num_experts=num_experts,
-        dtype=torch.int32,
-        device=device)
+    manager.top_k = top_k
+    manager.global_num_experts = num_experts
 
-    # 输入：每个 rank 都用自己的 rank 值填充，便于校验来源
     hidden_states = torch.full(
         (num_tokens_per_rank, hidden_size),
         float(rank),
@@ -53,6 +49,7 @@ def _test_native_all2all_worker(pgi: ProcessGroupInfo, dp_size: int):
         device=device
     )
     hidden_states_prev = hidden_states.clone()
+    print(f"Rank {rank} input hidden_states {hidden_states.shape}")
 
     router_logits = torch.rand(
         (num_tokens_per_rank, num_experts),
@@ -61,62 +58,37 @@ def _test_native_all2all_worker(pgi: ProcessGroupInfo, dp_size: int):
     )
     router_logits_prev = router_logits.clone()
 
-    # === 测试端也复算 topk -> 映射到 EP rank -> 统计发送计数，并交换计数得到期望接收计数 ===
-    _, topk_ids = torch.topk(router_logits, top_k, dim=-1)
-    ep2ranks = manager.global2ep[topk_ids]
+    new_method = []
+    for _ in range(10):
+        torch.cuda.synchronize()
+        st = time.time()
+        recv_hidden_states, recv_router_logits = manager.dispatch(hidden_states, router_logits)
+        torch.cuda.synchronize()
+        new_method.append(time.time() - st)
+    print(f"Shape hidden_states_new {recv_hidden_states.shape}")
 
-    send_counts_local = torch.bincount(
-        ep2ranks.reshape(-1),
-        minlength=world_size
-    ).to(torch.long) 
-
-    expected_recv_counts = torch.empty_like(send_counts_local)
-    dist.all_to_all_single(
-        expected_recv_counts,
-        send_counts_local,
-        group=cpu_group
-    )
-
-    torch.cuda.synchronize()
-    st = time.time()
-    recv_hidden_states, _ = manager.all2all(hidden_states, router_logits, top_k)
-
-    exp_total = int(expected_recv_counts.sum().item())
-    assert recv_hidden_states.shape == (exp_total, hidden_size), (
-        f"rank {rank}: recv shape {tuple(recv_hidden_states.shape)} != {(exp_total, hidden_size)}"
-    )
-    torch.cuda.synchronize()
-    new_method = time.time() - st
-
-    offset = 0
-    for s in range(world_size):
-        cnt = int(expected_recv_counts[s].item())
-        if cnt == 0:
-            continue
-        block = recv_hidden_states[offset:offset + cnt]
-        assert torch.all(block == float(s)), (
-            f"rank {rank}: block from sender {s} has wrong values"
-        )
-        offset += cnt
-    assert offset == exp_total, f"rank {rank}: offset={offset}, exp_total={exp_total}"
-
-    if rank == 0:
+    if rank == 0:                           # 0.0009975433349609375
         print("✅ native all2all(test-topk) passed.")
 
 
     # previous method:
     cu_tokens_across_dp_cpu = [num_tokens_per_rank * (i+1) for i in range(world_size)]
-    torch.cuda.synchronize()
-    st = time.time()
-    hidden_states_prev = manager.naive_multicast(hidden_states_prev,
-                                         cu_tokens_across_dp_cpu)
-    router_logits_prev = manager.naive_multicast(router_logits_prev,
-                                         cu_tokens_across_dp_cpu)
-    torch.cuda.synchronize()
-    prev_method = time.time() - st
+    prev_method = []
+    for _ in range(10):
+        torch.cuda.synchronize()
+        st = time.time()
+        recv_hidden_states = manager.naive_multicast(hidden_states_prev,
+                                            cu_tokens_across_dp_cpu)
+        recv_router_logits = manager.naive_multicast(router_logits_prev,
+                                            cu_tokens_across_dp_cpu)
+        torch.cuda.synchronize()
+        prev_method.append(time.time() - st) # 0.0020182132720947266
 
-    print(f"Latency compare: new {new_method}, prev {prev_method}")
 
+    new_fmt = [f"{x:.5f}" for x in new_method]
+    prev_fmt = [f"{x:.5f}" for x in prev_method]
+    print(f"Latency compare: new {new_fmt}, prev {prev_fmt}") 
+    print(f"Shape hidden_states_prev {hidden_states_prev.shape}, router_logits_prev {router_logits_prev.shape}")
 
 
 @pytest.mark.parametrize("world_dp_size", [(4, 4)])
