@@ -97,6 +97,9 @@ class NaiveAll2AllManager(All2AllManagerBase):
         super().__init__(cpu_group)
         self.router_logits: torch.Tensor = None
         self.all2all_buffer: torch.Tensor = None
+        self.cached_send_lengths: list[int] = None
+        self.cached_recv_lengths: list[int] = None
+
 
     def naive_multicast(self, x: torch.Tensor,
                         cu_tokens_across_dp_cpu: torch.Tensor):
@@ -115,7 +118,7 @@ class NaiveAll2AllManager(All2AllManagerBase):
             self.dp_group.broadcast(buffer[start:end, :], idx)
 
         return buffer
-    
+
     def all_to_all(self, input_: torch.Tensor, reversed: bool) -> torch.Tensor:
         world_size = self.dp_group.world_size
         if world_size == 1:
@@ -125,29 +128,22 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
         # 规定每个rank上发送的token数量相同
         if reversed:
-            send_lengths = map_recv_token_sizes_to_ranks(
-                rank=self.rank,
-                world_size=world_size,
-                total_tokens=total_send_length,
-            )
-            recv_lengths = map_send_token_sizes_to_ranks(
-                rank=self.rank,
-                world_size=world_size,
-                total_tokens=total_send_length,
-            )
+            send_lengths = self.cached_recv_lengths
+            recv_lengths = self.cached_send_lengths
         else:
             send_lengths = map_send_token_sizes_to_ranks(
                 rank=self.rank,
                 world_size=world_size,
                 total_tokens=total_send_length,
             )
+            self.cached_send_lengths = send_lengths
             recv_lengths = map_recv_token_sizes_to_ranks(
                 rank=self.rank,
                 world_size=world_size,
                 total_tokens=total_send_length,
             )
+            self.cached_recv_lengths = recv_lengths
         total_recv_length = sum(recv_lengths)
-        print(f"Rank {self.rank} send lengths: {send_lengths}, recv lengths: {recv_lengths}")
 
         # fetch recv buffer
         if self.all2all_buffer is None or \
@@ -203,6 +199,7 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.all_to_all(hidden_states, reversed=True)
+        hidden_states = hidden_states[:hidden_states.size(0) // self.top_k, :]
         return hidden_states
 
     def destroy(self):
