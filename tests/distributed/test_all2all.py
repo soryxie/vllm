@@ -49,26 +49,34 @@ def _test_native_all2all_worker(pgi: ProcessGroupInfo, dp_size: int):
     )
     hidden_states_prev = hidden_states.clone()
     print(f"Rank {rank} input hidden_states {hidden_states.shape}")
-
     router_logits = torch.rand(
         (num_tokens_per_rank, num_experts),
         dtype=torch.float32,
         device=device
     )
-    router_logits_prev = router_logits.clone()
 
-    recv_hidden_states, _ = manager.dispatch(hidden_states, router_logits)
+    recv_hidden_states, recv_router_logits = manager.dispatch(hidden_states, router_logits)
+
+    # check that total sent tokens equals total received tokens
+    total_sent = torch.tensor(hidden_states.shape[0] * top_k,
+                            dtype=torch.long,
+                            device=device)
+    total_recv = torch.tensor(recv_hidden_states.shape[0],
+                            dtype=torch.long,
+                            device=device)
+    dist.all_reduce(total_sent)
+    dist.all_reduce(total_recv)
+    assert total_sent == total_recv, f"Rank {rank}: total sent {total_sent} != total recv {total_recv}"
+
+    # check that the router logits are correct
+    ep_local_size = num_experts // world_size
+    start = rank * ep_local_size
+    end = (rank + 1) * ep_local_size
+    topk_ids = torch.topk(recv_router_logits, top_k, dim=1).indices
+    assert torch.all(topk_ids >= start) and torch.all(topk_ids < end), f"Rank {rank}: recv router logits have invalid expert ids: {topk_ids}"
+
     combined_hidden_states = manager.combine(recv_hidden_states)
     assert combined_hidden_states.shape == hidden_states_prev.shape
-
-    # The combined states should be the same as the original repeated states.
-    # Since each rank has a unique value, we can check if all values in the
-    # tensor are the ones originally from this rank.
-    # expected_value = float(rank)
-    # assert torch.allclose(
-    #     combined_hidden_states,
-    #     torch.full_like(combined_hidden_states, expected_value)
-    # ), f"Rank {rank}: combined states not all equal to {expected_value}"
 
     if rank == 0:
         print("✅ native all2all dispatch and combine passed.")

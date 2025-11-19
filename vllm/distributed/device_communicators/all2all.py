@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING, Any
 
+import time
 import torch
 import torch.distributed as dist
 
@@ -56,35 +57,6 @@ def _scale_distribution(base_distribution: list[int], target_total: int) -> list
         floored[destination] += 1
     return floored
 
-def map_send_token_sizes_to_ranks(rank: int, world_size: int, total_tokens: int) -> list[int]:
-    if world_size <= 0:
-        raise ValueError("world_size must be positive.")
-    if not (0 <= rank < world_size):
-        raise ValueError(f"rank {rank} must be within [0, {world_size}).")
-    if world_size > len(TOKEN_DISTRIBUTION):
-        raise ValueError("world_size exceeds TOKEN_DISTRIBUTION definitions.")
-
-    base_row = TOKEN_DISTRIBUTION[rank][:world_size]
-    return _scale_distribution(base_row, total_tokens)
-
-
-def map_recv_token_sizes_to_ranks(rank: int, world_size: int, total_tokens: int) -> list[int]:
-    if world_size <= 0:
-        raise ValueError("world_size must be positive.")
-    if not (0 <= rank < world_size):
-        raise ValueError(f"rank {rank} must be within [0, {world_size}).")
-
-    recv_sizes = []
-    for sender_rank in range(world_size):
-        send_distribution = map_send_token_sizes_to_ranks(
-            rank=sender_rank,
-            world_size=world_size,
-            total_tokens=total_tokens,
-        )
-        recv_sizes.append(send_distribution[rank])
-    return recv_sizes
-
-
 class NaiveAll2AllManager(All2AllManagerBase):
     """
     A naive implementation of all2all communication.
@@ -99,6 +71,33 @@ class NaiveAll2AllManager(All2AllManagerBase):
         self.all2all_buffer: torch.Tensor = None
         self.cached_send_lengths: list[int] = None
         self.cached_recv_lengths: list[int] = None
+        world_size = self.dp_group.world_size
+        device = self.dp_group.device
+        self._split_sizes = [1] * world_size
+        self._send_tensor = torch.empty(world_size, dtype=torch.int64, device=device)
+        self._recv_tensor = torch.empty(world_size, dtype=torch.int64, device=device)
+
+    def _map_send_token_sizes_to_ranks(self, total_tokens: int) -> list[int]:
+        world_size = self.world_size
+        rank = self.rank
+        assert world_size in [2, 4, 8], "world_size must be 2, 4, or 8."
+        base_row = TOKEN_DISTRIBUTION[rank][:world_size]
+        return _scale_distribution(base_row, total_tokens)
+
+    def _fetch_recv_token_sizes(self, send_lengths: list[int]) -> list[int]:
+        """Exchange send_lengths to compute the recv sizes for `rank`."""
+        world_size = self.world_size
+        process_group = self.dp_group.device_group
+        assert len(send_lengths) == world_size, "send_lengths must have `world_size` elements."
+        for idx in range(world_size):
+            self._send_tensor[idx] = int(send_lengths[idx])
+        dist.all_to_all_single(
+            self._recv_tensor, self._send_tensor,
+            output_split_sizes=self._split_sizes,
+            input_split_sizes=self._split_sizes,
+            group=process_group
+        )
+        return self._recv_tensor.tolist()
 
 
     def naive_multicast(self, x: torch.Tensor,
@@ -120,28 +119,21 @@ class NaiveAll2AllManager(All2AllManagerBase):
         return buffer
 
     def all_to_all(self, input_: torch.Tensor, reversed: bool) -> torch.Tensor:
-        world_size = self.dp_group.world_size
+        world_size = self.world_size
         if world_size == 1:
             return input_
         total_send_length = input_.size(0)
         hidden_size = input_.size(1)
 
-        # 规定每个rank上发送的token数量相同
         if reversed:
             send_lengths = self.cached_recv_lengths
             recv_lengths = self.cached_send_lengths
         else:
-            send_lengths = map_send_token_sizes_to_ranks(
-                rank=self.rank,
-                world_size=world_size,
-                total_tokens=total_send_length,
-            )
+            send_lengths = self._map_send_token_sizes_to_ranks(
+                total_tokens=total_send_length)
             self.cached_send_lengths = send_lengths
-            recv_lengths = map_recv_token_sizes_to_ranks(
-                rank=self.rank,
-                world_size=world_size,
-                total_tokens=total_send_length,
-            )
+            recv_lengths = self._fetch_recv_token_sizes(
+                send_lengths=send_lengths)
             self.cached_recv_lengths = recv_lengths
         total_recv_length = sum(recv_lengths)
 
@@ -151,10 +143,13 @@ class NaiveAll2AllManager(All2AllManagerBase):
             self.all2all_buffer = torch.empty(
                 total_recv_length*hidden_size*4,
                 dtype=input_.dtype,
-                device=self.dp_group.device,
+                device=input_.device,
             )
         recv_buffer = self.all2all_buffer[:total_recv_length*hidden_size].view(-1, hidden_size)
 
+        # print(f"Rank {self.dp_group.rank}: all_to_all send_lengths={send_lengths}, "
+        #       f"recv_lengths={recv_lengths}, total_send_length={total_send_length}, "
+        #       f"total_recv_length={total_recv_length}, input_shape={input_.shape}")
         torch.distributed.all_to_all_single(
             recv_buffer,
             input_,
@@ -172,6 +167,9 @@ class NaiveAll2AllManager(All2AllManagerBase):
                 "top_k and global_num_experts must be set before dispatch."
             )
 
+        # torch.cuda.synchronize()
+        # print(f"Rank {self.dp_group.rank}: NaiveAll2All dispatch started. shape={hidden_states.shape}")
+        # st = time.perf_counter()
         hidden_states = hidden_states.repeat(self.top_k, 1)
         hidden_states = self.all_to_all(hidden_states, reversed=False)
 
@@ -186,8 +184,9 @@ class NaiveAll2AllManager(All2AllManagerBase):
 
             ep_ids = torch.arange(start, start + ep_local_size, device=device)
             offsets = torch.arange(self.top_k, device=device)
-            ep_id_matrix = (ep_ids.unsqueeze(1) + offsets) % num_experts
-
+            ep_id_matrix = start + \
+                    (torch.arange(ep_local_size, device=device).unsqueeze(1) + offsets) \
+                    % ep_local_size
             prob_rows = torch.zeros(ep_local_size, num_experts,
                                     dtype=router_logits.dtype, device=device)
             row_idx = torch.arange(ep_local_size, device=device).unsqueeze(1)
@@ -195,11 +194,21 @@ class NaiveAll2AllManager(All2AllManagerBase):
             repeat_times = num_tokens // ep_local_size + 1
             self.router_logits = prob_rows.repeat(repeat_times, 1)
 
+        # torch.cuda.synchronize()
+        # ed = time.perf_counter()
+        # print(f"Rank {self.dp_group.rank}: NaiveAll2All dispatch all_to_all time: {ed - st}s, shape={hidden_states.shape}")
         return hidden_states, self.router_logits[:num_tokens]
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # torch.cuda.synchronize()
+        # st = time.perf_counter()
+        # print(f"Rank {self.dp_group.rank}: NaiveAll2All combine started. shape={hidden_states.shape}")
         hidden_states = self.all_to_all(hidden_states, reversed=True)
+        # torch.cuda.synchronize()
+        # ed = time.perf_counter()
+
         hidden_states = hidden_states[:hidden_states.size(0) // self.top_k, :]
+        # print(f"Rank {self.dp_group.rank}: NaiveAll2All combine all_to_all time: {ed - st}s, shape={hidden_states.shape}")
         return hidden_states
 
     def destroy(self):

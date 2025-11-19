@@ -23,8 +23,11 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 from collections.abc import Iterable
+from math import e
 from typing import Any, Optional, Union
 
+import time
+from torch import distributed as dist
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -33,6 +36,7 @@ from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -332,13 +336,25 @@ class Qwen3MoeModel(nn.Module):
             config.hidden_size,
             prefix=f"{prefix}.embed_tokens")
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            3,
             lambda prefix: Qwen3MoeDecoderLayer(config=config,
                                                 cache_config=cache_config,
                                                 quant_config=quant_config,
                                                 prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        self.reused_ratio = 0.6
+        self.reuse_tensor = None
+        self.kv_block_size = 128
+        self.kv_num_heads = 16
+        self.kv_head_dim = 128
+        self.kv_dtype = torch.bfloat16
+
+        self.kv_block_tensors = [torch.rand(
+            (2, self.kv_block_size, self.kv_num_heads, self.kv_head_dim), 
+            dtype=self.dtype, device=self.device) for _ in range(32)
+        ]
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
@@ -364,9 +380,41 @@ class Qwen3MoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        p2d_length = int(hidden_states.shape[0] / self.reused_ratio)
+        p2d_blocks = (p2d_length + self.kv_block_size - 1) // self.kv_block_size
+        reused_blocks = (p2d_length - hidden_states.shape[0] + self.kv_block_size - 1) // self.kv_block_size
+        assert p2d_blocks + reused_blocks <= len(self.kv_block_tensors), \
+            f"Not enough pre-allocated kv blocks: required {p2d_blocks + reused_blocks}, available {len(self.kv_block_tensors)}"
+        rank = get_dp_group().rank
+        world_size = get_dp_group().world_size
         for i in range(self.start_layer, self.end_layer):
+            if rank < world_size // 2: # send p2d, recv reused
+                peer = rank + world_size // 2
+                ops = [
+                    dist.P2POp(dist.isend, self.kv_block_tensors[i], peer) for i in range(p2d_blocks)
+                ] + [
+                    dist.P2POp(dist.irecv, self.kv_block_tensors[i + p2d_blocks], peer) for i in range(reused_blocks)
+                ]
+            else: # recv p2d, send reused
+                peer = rank - world_size // 2
+                ops = [
+                    dist.P2POp(dist.irecv, self.kv_block_tensors[i], peer) for i in range(p2d_blocks)
+                ] + [
+                    dist.P2POp(dist.isend, self.kv_block_tensors[i + p2d_blocks], peer) for i in range(reused_blocks)
+                ]
+            reqs = dist.batch_isend_irecv(ops)
+            
+            # torch.cuda.synchronize()
+            # st = time.perf_counter()
+
             layer = self.layers[i]
             hidden_states, residual = layer(positions, hidden_states, residual)
+            dist.batch_wait(reqs)
+            
+            # torch.cuda.synchronize()
+            # ed = time.perf_counter()
+            # print(f"Rank {get_pp_group().rank}: Layer {i} time: {ed - st}s")
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
