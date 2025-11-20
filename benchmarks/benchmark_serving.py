@@ -197,7 +197,7 @@ async def get_request(
 
         # Sample the request interval from the gamma distribution.
         # If burstiness is 1, it follows exponential distribution.
-        interval = np.random.gamma(shape=burstiness, scale=theta)
+        interval = 0 # np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 

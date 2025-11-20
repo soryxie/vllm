@@ -1,6 +1,6 @@
 export NCCL_DEBUG=INFO
 export HF_HOME=/mnt/nfs/songrun/huggingface
-export NCCL_IB_HCA=mlx5_0
+export NCCL_IB_HCA=mlx5_0,mlx5_2
 export NCCL_IB_GID_INDEX=3 
 export NCCL_SHM_DISABLE=1
 export NCCL_P2P_DISABLE=1
@@ -9,6 +9,61 @@ vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507 \
     --tensor-parallel-size 1 \
     --data-parallel-size 4 \
     --enable-expert-parallel \
+    --no-enable-prefix-caching \
+    --max-num-seqs 4 \
+    --enforce-eager
+
+# 12
+# link mlx5_49/1 state ACTIVE physical_state LINK_UP netdev eno0 
+# link mlx5_113/1 state ACTIVE physical_state LINK_UP
+
+# 11
+# link mlx5_0/1 state ACTIVE physical_state LINK_UP 
+# link mlx5_2/1 state ACTIVE physical_state LINK_UP 
+# link mlx5_49/1 state ACTIVE physical_state LINK_UP 
+# link mlx5_39/1 state ACTIVE physical_state LINK_UP netdev eno0 
+# link mlx5_113/1 state ACTIVE physical_state LINK_UP 
+# link mlx5_103/1 state ACTIVE physical_state LINK_UP 
+
+
+# Node 0  (with ip address 192.168.1.48)
+export NCCL_DEBUG=INFO
+export HF_HOME=/mnt/nfs/songrun/huggingface
+export NCCL_IB_HCA=mlx5_0,mlx5_2
+export NCCL_IB_GID_INDEX=3 
+export NCCL_SHM_DISABLE=1
+export NCCL_P2P_DISABLE=1
+vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --port 8848 \
+    --tensor-parallel-size 1 \
+    --data-parallel-size 8 \
+    --data-parallel-size-local 4 \
+    --data-parallel-address 10.0.12.1 \
+    --data-parallel-rpc-port 13345 \
+    --enable-expert-parallel \
+    --no-enable-prefix-caching \
+    --max-num-seqs 4 \
+    --enforce-eager
+
+# Node 1
+export NCCL_DEBUG=INFO
+export HF_HOME=/mnt/nfs/songrun/huggingface
+export NCCL_IB_HCA=mlx5_0,mlx5_2
+export NCCL_IB_GID_INDEX=3 
+export NCCL_SHM_DISABLE=1
+export NCCL_P2P_DISABLE=1
+vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --port 8848 \
+    --tensor-parallel-size 1 \
+    --headless \
+    --data-parallel-size 8 \
+    --data-parallel-size-local 4 \
+    --data-parallel-start-rank 4 \
+    --data-parallel-address 10.0.12.1 \
+    --data-parallel-rpc-port 13345 \
+    --enable-expert-parallel \
+    --no-enable-prefix-caching \
+    --max-num-seqs 4 \
     --enforce-eager
 
 

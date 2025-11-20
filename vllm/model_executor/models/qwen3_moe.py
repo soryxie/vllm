@@ -27,6 +27,7 @@ from math import e
 from typing import Any, Optional, Union
 
 import time
+from regex import F
 from torch import distributed as dist
 import torch
 from torch import nn
@@ -327,6 +328,7 @@ class Qwen3MoeModel(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        device_config = vllm_config.device_config
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -350,9 +352,11 @@ class Qwen3MoeModel(nn.Module):
         self.kv_head_dim = 128
         self.kv_dtype = torch.bfloat16
 
-        self.kv_block_tensors = [torch.rand(
-            (2, self.kv_block_size, self.kv_num_heads, self.kv_head_dim), 
-            dtype=self.dtype, device=self.device) for _ in range(32)
+        self.kv_block_tensors = [
+            torch.randn(
+                (2, self.kv_block_size, self.kv_num_heads, self.kv_head_dim),
+                dtype=self.kv_dtype, device=device_config.device
+            )for _ in range(40)
         ]
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -382,39 +386,67 @@ class Qwen3MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         p2d_length = int(hidden_states.shape[0] / self.reused_ratio)
-        p2d_blocks = (p2d_length + self.kv_block_size - 1) // self.kv_block_size
-        reused_blocks = (p2d_length - hidden_states.shape[0] + self.kv_block_size - 1) // self.kv_block_size
-        assert p2d_blocks + reused_blocks <= len(self.kv_block_tensors), \
-            f"Not enough pre-allocated kv blocks: required {p2d_blocks + reused_blocks}, available {len(self.kv_block_tensors)}"
+        p2d_blocks = (p2d_length + self.kv_block_size -
+                      1) // self.kv_block_size
+        reused_blocks = (p2d_length - hidden_states.shape[0] +
+                         self.kv_block_size - 1) // self.kv_block_size
         rank = get_dp_group().rank
         world_size = get_dp_group().world_size
+        dp_group = get_dp_group()
+        local_counts = torch.tensor([p2d_blocks, reused_blocks],
+                                    dtype=torch.int,
+                                    device=hidden_states.device)
+        all_counts = torch.empty(world_size,
+                                 2,
+                                 dtype=torch.int,
+                                 device=hidden_states.device)
+        dist.all_gather_into_tensor(all_counts, local_counts, group=dp_group.device_group)
+
         for i in range(self.start_layer, self.end_layer):
-            if rank < world_size // 2: # send p2d, recv reused
+            if rank < world_size // 2:  # send p2d, recv reused
                 peer = rank + world_size // 2
+                send_p2d_blocks = all_counts[rank, 0].item()
+                recv_reused_blocks = all_counts[peer, 1].item()
+                assert send_p2d_blocks + recv_reused_blocks <= len(
+                    self.kv_block_tensors
+                ), f"Not enough pre-allocated kv blocks: required {send_p2d_blocks + recv_reused_blocks}, available {len(self.kv_block_tensors)}"
                 ops = [
-                    dist.P2POp(dist.isend, self.kv_block_tensors[i], peer) for i in range(p2d_blocks)
+                    dist.P2POp(dist.isend, self.kv_block_tensors[i], peer)
+                    for i in range(send_p2d_blocks)
                 ] + [
-                    dist.P2POp(dist.irecv, self.kv_block_tensors[i + p2d_blocks], peer) for i in range(reused_blocks)
+                    dist.P2POp(dist.irecv,
+                               self.kv_block_tensors[i + send_p2d_blocks],
+                               peer) for i in range(recv_reused_blocks)
                 ]
-            else: # recv p2d, send reused
+            else:  # recv p2d, send reused
                 peer = rank - world_size // 2
+                recv_p2d_blocks = all_counts[peer, 0].item()
+                send_reused_blocks = all_counts[rank, 1].item()
+                assert recv_p2d_blocks + send_reused_blocks <= len(
+                    self.kv_block_tensors
+                ), f"Not enough pre-allocated kv blocks: required {recv_p2d_blocks + send_reused_blocks}, available {len(self.kv_block_tensors)}"
                 ops = [
-                    dist.P2POp(dist.irecv, self.kv_block_tensors[i], peer) for i in range(p2d_blocks)
+                    dist.P2POp(dist.irecv, self.kv_block_tensors[i], peer)
+                    for i in range(recv_p2d_blocks)
                 ] + [
-                    dist.P2POp(dist.isend, self.kv_block_tensors[i + p2d_blocks], peer) for i in range(reused_blocks)
+                    dist.P2POp(dist.isend,
+                               self.kv_block_tensors[i + recv_p2d_blocks],
+                               peer) for i in range(send_reused_blocks)
                 ]
-            reqs = dist.batch_isend_irecv(ops)
-            
+
             # torch.cuda.synchronize()
             # st = time.perf_counter()
-
+            reqs = dist.batch_isend_irecv(ops)
             layer = self.layers[i]
+            for req in reqs:
+                req.wait()
+
             hidden_states, residual = layer(positions, hidden_states, residual)
-            dist.batch_wait(reqs)
+
             
             # torch.cuda.synchronize()
             # ed = time.perf_counter()
-            # print(f"Rank {get_pp_group().rank}: Layer {i} time: {ed - st}s")
+            # print(f"Rank {rank}: Layer {i} time: {ed - st}s, ops count: {len(ops)}")
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
